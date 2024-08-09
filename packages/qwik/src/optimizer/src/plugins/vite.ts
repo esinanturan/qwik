@@ -24,6 +24,7 @@ import {
   QWIK_JSX_RUNTIME_ID,
   Q_MANIFEST_FILENAME,
   SSR_OUT_DIR,
+  TRANSFORM_REGEX,
   createPlugin,
   parseId,
   type NormalizedQwikPluginOptions,
@@ -40,7 +41,20 @@ const DEDUPE = [QWIK_CORE_ID, QWIK_JSX_RUNTIME_ID, QWIK_JSX_DEV_RUNTIME_ID];
 const STYLING = ['.css', '.scss', '.sass', '.less', '.styl', '.stylus'];
 const FONTS = ['.woff', '.woff2', '.ttf'];
 
-/** @public */
+/**
+ * Workaround to make the api be defined in the type.
+ *
+ * @internal
+ */
+type P<T> = VitePlugin<T> & { api: T; config: Extract<VitePlugin<T>['config'], Function> };
+
+/**
+ * The types for Vite/Rollup don't allow us to be too specific about the return type. The correct
+ * return type is `[QwikVitePlugin, VitePlugin<never>]`, and if you search the plugin by name you'll
+ * get the `QwikVitePlugin`.
+ *
+ * @public
+ */
 export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
   let isClientDevOnly = false;
   let clientDevInput: undefined | string = undefined;
@@ -55,7 +69,9 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
   let rootDir: string | null = null;
 
   let ssrOutDir: string | null = null;
-  const fileFilter = qwikViteOpts.fileFilter || (() => true);
+  const fileFilter: QwikVitePluginOptions['fileFilter'] = qwikViteOpts.fileFilter
+    ? (id, type) => TRANSFORM_REGEX.test(id) || qwikViteOpts.fileFilter!(id, type)
+    : () => true;
   const injections: GlobalInjections[] = [];
   const qwikPlugin = createPlugin(qwikViteOpts.optimizerOptions);
 
@@ -91,7 +107,7 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
   // Vite hooks. The second plugin is a post plugin that is called after the build has finished.
   // The post plugin is used to generate the Qwik manifest file that is used during SSR to
   // generate QRLs for event handlers.
-  const vitePluginPre: VitePlugin = {
+  const vitePluginPre: P<QwikVitePluginApi> = {
     name: 'vite-plugin-qwik',
     enforce: 'pre',
     api,
@@ -132,7 +148,7 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
       qwikPlugin.debug(`vite config(), command: ${viteCommand}, env.mode: ${viteEnv.mode}`);
 
       if (viteCommand === 'serve') {
-        qwikViteOpts.entryStrategy = { type: 'hook' };
+        qwikViteOpts.entryStrategy = { type: 'segment' };
       } else {
         if (target === 'ssr') {
           qwikViteOpts.entryStrategy = { type: 'hoist' };
@@ -143,7 +159,6 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
 
       const shouldFindVendors =
         !qwikViteOpts.disableVendorScan && (target !== 'lib' || viteCommand === 'serve');
-      const vendorRoots = shouldFindVendors ? await findQwikRoots(sys, sys.cwd()) : [];
       viteAssetsDir = viteConfig.build?.assetsDir;
       const useAssetsDir = target === 'client' && !!viteAssetsDir && viteAssetsDir !== '_astro';
       const pluginOpts: QwikPluginOptions = {
@@ -157,7 +172,6 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
         tsconfigFileNames: qwikViteOpts.tsconfigFileNames,
         resolveQwikBuild: true,
         transformedModuleOutput: qwikViteOpts.transformedModuleOutput,
-        vendorRoots: [...(qwikViteOpts.vendorRoots ?? []), ...vendorRoots.map((v) => v.path)],
         outDir: viteConfig.build?.outDir,
         assetsDir: useAssetsDir ? viteAssetsDir : undefined,
         devTools: qwikViteOpts.devTools,
@@ -271,6 +285,7 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
         clientDevInput = qwikPlugin.normalizePath(clientDevInput);
       }
 
+      const vendorRoots = shouldFindVendors ? await findQwikRoots(sys, sys.cwd()) : [];
       const vendorIds = vendorRoots.map((v) => v.id);
       const isDevelopment = buildMode === 'development';
       const qDevKey = 'globalThis.qDev';
@@ -317,6 +332,11 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
           dynamicImportVarsOptions: {
             exclude: [/./],
           },
+          rollupOptions: {
+            output: {
+              manualChunks: qwikPlugin.manualChunks,
+            },
+          },
         },
         define: {
           [qDevKey]: qDev,
@@ -334,12 +354,14 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
 
         updatedViteConfig.build!.cssCodeSplit = false;
         updatedViteConfig.build!.outDir = buildOutputDir;
+        const origOnwarn = updatedViteConfig.build!.rollupOptions?.onwarn;
         updatedViteConfig.build!.rollupOptions = {
           input: opts.input,
           output: normalizeRollupOutputOptions(
             opts,
             viteConfig.build?.rollupOptions?.output,
             useAssetsDir,
+            qwikPlugin.manualChunks,
             buildOutputDir
           ),
           preserveEntrySignatures: 'exports-only',
@@ -347,7 +369,7 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
             if (warning.plugin === 'typescript' && warning.message.includes('outputToFilesystem')) {
               return;
             }
-            warn(warning);
+            origOnwarn ? origOnwarn(warning, warn) : warn(warning);
           },
         };
 
@@ -478,7 +500,7 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
     },
   };
 
-  const vitePluginPost: VitePlugin = {
+  const vitePluginPost: VitePlugin<never> = {
     name: 'vite-plugin-qwik-post',
     enforce: 'post',
 
@@ -675,7 +697,6 @@ export function qwikVite(qwikViteOpts: QwikVitePluginOptions = {}): any {
             path,
             isClientDevOnly,
             clientDevInput,
-            qwikPlugin.foundQrls,
             devSsrServer
           );
         };
@@ -891,7 +912,7 @@ interface QwikVitePluginCommonOptions {
   debug?: boolean;
   /**
    * The Qwik entry strategy to use while building for production. During development the type is
-   * always `hook`.
+   * always `segment`.
    *
    * Default `{ type: "smart" }`)
    */
@@ -913,6 +934,8 @@ interface QwikVitePluginCommonOptions {
    * List of directories to recursively search for Qwik components or Vendors.
    *
    * Default `[]`
+   *
+   * @deprecated No longer used. Instead, any imported file with `.qwik.` in the name is processed.
    */
   vendorRoots?: string[];
   /**
@@ -1062,11 +1085,15 @@ export interface QwikVitePluginApi {
   getAssetsDir: () => string | undefined;
 }
 
-/** @public */
-export interface QwikVitePlugin {
+/**
+ * This is the type of the "pre" Qwik Vite plugin. `qwikVite` actually returns a tuple of two
+ * plugins, but after Vite flattens them, you can find the plugin by name.
+ *
+ * @public
+ */
+export type QwikVitePlugin = P<QwikVitePluginApi> & {
   name: 'vite-plugin-qwik';
-  api: QwikVitePluginApi;
-}
+};
 
 /** @public */
 export interface QwikViteDevResponse {
